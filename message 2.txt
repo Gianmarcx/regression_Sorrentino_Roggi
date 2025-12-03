@@ -1,0 +1,194 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import RidgeCV, LassoCV
+from sklearn.metrics import r2_score, mean_squared_error
+
+# ==============================
+# 1. Caricamento dati
+# ==============================
+
+df = pd.read_csv("california_housing_data.csv")
+print("Osservazioni iniziali:", len(df))
+
+# ==============================
+# 2. Pulizia valori impossibili (su TUTTO il dataset)
+#    Questo NON è data leakage, sono vincoli logici.
+# ==============================
+
+cond = (
+    (df["MedInc"] > 0) &
+    (df["HouseAge"] >= 0) &
+    (df["AveRooms"] > 0) &
+    (df["AveBedrms"] > 0) &
+    (df["Population"] > 0) &
+    (df["AveOccup"] > 0) &
+    (df["MedHouseVal"] > 0)
+)
+
+df = df[cond].copy()
+df = df.dropna()
+
+print("Dopo rimozione valori impossibili:", len(df))
+
+# ==============================
+# 3. Feature engineering (su TUTTO il dataset)
+# ==============================
+
+df["BedroomsPerRoom"] = df["AveBedrms"] / df["AveRooms"]
+df["PersonsPerRoom"] = df["AveOccup"] / df["AveRooms"]
+df["MedInc_sq"] = df["MedInc"] ** 2
+df["DistToCoast"] = (df["Longitude"] + 120).abs()
+
+# ==============================
+# 4. Train-test split (sul df già pulito + feature)
+# ==============================
+
+train_df, test_df = train_test_split(
+    df,
+    test_size=0.2,
+    random_state=42
+)
+
+print("Train grezzo:", len(train_df))
+print("Test grezzo:", len(test_df))
+
+# ==============================
+# 5. Funzioni per IQR (calcolato SOLO sul train)
+# ==============================
+
+def compute_iqr_bounds(df_in, columns):
+    bounds = {}
+    for col in columns:
+        Q1 = df_in[col].quantile(0.25)
+        Q3 = df_in[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+        bounds[col] = (lower, upper)
+    return bounds
+
+def filter_with_bounds(df_in, bounds):
+    mask = np.ones(len(df_in), dtype=bool)
+    for col, (lower, upper) in bounds.items():
+        mask &= (df_in[col] >= lower) & (df_in[col] <= upper)
+    return df_in[mask]
+
+def clip_with_bounds(df_in, bounds):
+    df_out = df_in.copy()
+    for col, (lower, upper) in bounds.items():
+        df_out[col] = df_out[col].clip(lower=lower, upper=upper)
+    return df_out
+
+# ==============================
+# 6. Calcolo IQR sul TRAIN e rimozione outliers SOLO dal TRAIN
+# ==============================
+
+cols_to_clean = [
+    "MedInc",
+    "HouseAge",
+    "AveRooms",
+    "AveBedrms",
+    "Population",
+    "AveOccup",
+    "BedroomsPerRoom",
+    "PersonsPerRoom"
+]
+
+bounds = compute_iqr_bounds(train_df, cols_to_clean)
+
+train_df_clean = clip_with_bounds(train_df, bounds)
+# Sul test NON filtriamo: al massimo "clippiamo" i valori estremi ai bounds del train
+test_df_clean = clip_with_bounds(test_df, bounds)
+
+print("Train dopo IQR:", len(train_df_clean))
+print("Test (solo clippato, nessuna riga rimossa):", len(test_df_clean))
+
+# ==============================
+# 7. Definizione X e y (train e test)
+# ==============================
+
+# Target in log
+y_train = np.log(train_df_clean["MedHouseVal"].values)
+y_test = np.log(test_df_clean["MedHouseVal"].values)
+
+# Regressori = tutte le colonne tranne il target
+X_train = train_df_clean.drop(columns=["MedHouseVal"])
+X_test = test_df_clean.drop(columns=["MedHouseVal"])
+
+feature_names = X_train.columns.to_numpy()
+
+X_train = X_train.values
+X_test = X_test.values
+
+print("Shape X_train:", X_train.shape)
+print("Shape X_test:", X_test.shape)
+
+# ==============================
+# 8. Standardizzazione (fit SOLO sul train)
+# ==============================
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ==============================
+# 9. Ridge Regression
+# ==============================
+
+alphas_ridge = np.logspace(-3, 3, 13)
+ridge = RidgeCV(alphas=alphas_ridge, cv=5)
+ridge.fit(X_train_scaled, y_train)
+
+y_pred_ridge = ridge.predict(X_test_scaled)
+
+ridge_r2 = r2_score(y_test, y_pred_ridge)
+ridge_mse = mean_squared_error(y_test, y_pred_ridge)
+ridge_rmse = np.sqrt(ridge_mse)
+
+print("\n===== RISULTATI RIDGE =====")
+print("Alpha scelto:", ridge.alpha_)
+print("R2 test:", round(ridge_r2, 4))
+print("MSE test:", round(ridge_mse, 6))
+print("RMSE test:", round(ridge_rmse, 4))
+
+ridge_coefs = pd.DataFrame({
+    "feature": feature_names,
+    "coef_ridge": ridge.coef_
+}).sort_values("coef_ridge", key=abs, ascending=False)
+
+print("\nTop 10 coefficienti Ridge (per valore assoluto):")
+print(ridge_coefs.head(10))
+
+# ==============================
+# 10. Lasso (per selezione variabili)
+# ==============================
+
+alphas_lasso = np.logspace(-3, 1, 50)
+lasso = LassoCV(alphas=alphas_lasso, cv=5, max_iter=10000, random_state=42)
+lasso.fit(X_train_scaled, y_train)
+
+y_pred_lasso = lasso.predict(X_test_scaled)
+
+lasso_r2 = r2_score(y_test, y_pred_lasso)
+lasso_mse = mean_squared_error(y_test, y_pred_lasso)
+lasso_rmse = np.sqrt(lasso_mse)
+
+print("\n===== RISULTATI LASSO =====")
+print("Alpha scelto:", lasso.alpha_)
+print("R2 test:", round(lasso_r2, 4))
+print("MSE test:", round(lasso_mse, 6))
+print("RMSE test:", round(lasso_rmse, 4))
+
+lasso_coefs = pd.DataFrame({
+    "feature": feature_names,
+    "coef_lasso": lasso.coef_
+}).sort_values("coef_lasso", key=abs, ascending=False)
+
+print("\nCoefficienti Lasso NON nulli:")
+print(lasso_coefs[lasso_coefs["coef_lasso"] != 0])
+
+print("\nVariabili eliminate dal Lasso (coef = 0):")
+print(lasso_coefs[lasso_coefs["coef_lasso"] == 0]["feature"].values)
